@@ -1,0 +1,417 @@
+
+# Functional Architecture (React) — UI/Logic Separation with Reuse-by-Composition
+*(Migration target for your existing `mvp-architecture.mdc`)*
+
+## Why this architecture
+- **Keep UI and logic separate** using **functional composition**: UI = presentational components; Logic = hooks/services.
+- **Reuse like inheritance** without the coupling: model common behavior in **base hooks**, **utility modules**, and **headless components** that can be composed.
+- **Testability**: logic lives in pure hooks/services; easy to unit test without the DOM.
+- **Scalability**: consistent folder shape per feature; co-locate but keep clear boundaries with index barrels.
+
+---
+
+## Core Principles
+1. **Functional-only pages/components**: prefer function components + hooks; avoid classes.
+2. **Presentation vs. Container split**:
+   - **UI (presentational)**: receives props, renders DOM, no side effects.
+   - **Logic (containers)**: custom hooks orchestrating data, state, and effects, then pass props down.
+3. **Composition over inheritance**:
+   - Use **base hooks** (`useFormBase`, `useListBase`, `useEntityBase`) that return a reusable API.
+   - Extend via **hook combinators** (compose multiple hooks) and **configuration objects**.
+4. **Thin feature shells, rich shared modules**: push shared behavior down into `/shared`.
+5. **Pure services** for side-effects (API, storage, router). Hooks **call** services; they don't contain the effect code directly.
+
+---
+
+## Folder Structure
+```
+src/
+  app/
+    providers/              # App-level contexts (AuthProvider, QueryClientProvider, ThemeProvider)
+    routes/                 # Route objects and lazy loaders only
+  shared/
+    hooks/
+      useFormBase.ts
+      useListBase.ts
+      useEntityBase.ts
+      usePagination.ts
+      useDebounce.ts
+      composeHooks.ts       # utility to compose hook outputs
+    services/
+      http/
+        client.ts           # axios/fetch wrapper
+        interceptors.ts
+      api/
+        patients.api.ts     # typed API surface per resource
+        appointments.api.ts
+      storage/
+        localStorage.ts
+    ui/                     # Headless, reusable presentational primitives
+      FormShell.tsx         # headless layout (no business logic)
+      DataTable.tsx
+      Modal.tsx
+      Spinner.tsx
+    utils/
+      fp.ts                 # tiny FP helpers (pipe, clamp, etc.)
+      format.ts             # formatters, currency, date
+      validation.ts         # zod/yup schemas or helpers
+    types/
+      index.ts              # global types, DTOs
+  features/
+    patients/
+      hooks/
+        usePatientList.ts
+        usePatientForm.ts
+      components/
+        PatientListView.tsx     # presentational
+        PatientFormView.tsx     # presentational
+      pages/
+        PatientsPage.tsx        # composes hooks + views
+        PatientCreatePage.tsx
+        PatientEditPage.tsx
+      index.ts
+    consultations/
+      hooks/
+        useConsultationForm.ts
+        useConsultationList.ts
+      components/
+        ConsultationFormView.tsx
+        ConsultationListView.tsx
+      pages/
+        ConsultationsPage.tsx
+      index.ts
+  test/
+    unit/
+    integration/
+```
+
+---
+
+## Roles Mapping (MVP → Functional)
+- **Model (M)** → **Services + Types**
+  - DTOs in `shared/types`, CRUD in `shared/services/api/*.ts` using a shared HTTP client.
+- **View (V)** → **Presentational Components**
+  - Stateless visuals live in `features/*/components`. Receive props only.
+- **Presenter (P)** → **Custom Hooks**
+  - One or more hooks per feature (`usePatientList`, `usePatientForm`) that orchestrate state/effects and expose a stable prop API for the View.
+
+### Base Presenter → Base Hook
+**Before (MVP):** `BasePresenter` with common list/form logic.  
+**After (Functional):** `useListBase`, `useFormBase`, `useEntityBase` returning a common, typed API.
+
+```ts
+// shared/hooks/useFormBase.ts
+import { useState } from "react";
+
+export type SubmitState<T> = { loading: boolean; error?: string | null; data?: T | null };
+
+export type FormBaseConfig<T, K> = {
+  initial: T;
+  validate?: (val: T) => K | null;           // e.g. return errors or null
+  submit: (val: T) => Promise<T>;            // side-effect lifted to services
+};
+
+export function useFormBase<T, K = Record<string, string>>(cfg: FormBaseConfig<T, K>) {
+  const [values, setValues] = useState<T>(cfg.initial);
+  const [state, setState] = useState<SubmitState<T>>({ loading: false, error: null, data: null });
+
+  const setField = <F extends keyof T>(field: F, value: T[F]) =>
+    setValues(v => ({ ...v, [field]: value }));
+
+  const reset = () => setValues(cfg.initial);
+
+  const validateNow = () => (cfg.validate ? cfg.validate(values) : null);
+
+  const onSubmit = async () => {
+    const errors = validateNow();
+    if (errors) return { ok: false as const, errors };
+    setState(s => ({ ...s, loading: true }));
+    try {
+      const result = await cfg.submit(values);
+      setState({ loading: false, data: result, error: null });
+      return { ok: true as const, data: result };
+    } catch (e: any) {
+      setState({ loading: false, error: e?.message ?? "Submit failed", data: null });
+      return { ok: false as const, error: e };
+    }
+  };
+
+  return {
+    values,
+    setField,
+    reset,
+    submitting: state.loading,
+    submitError: state.error,
+    onSubmit,
+  };
+}
+```
+
+*(See below for end-to-end examples where `useFormBase` is composed with feature logic.)*
+
+---
+
+## Example: Migrating a Form (Presenter → Hook + View)
+**Original (conceptual MVP):**
+- `PatientPresenter` handled: load record, local state, submit, toasts, navigation.
+- `PatientFormView` rendered inputs and called presenter methods.
+
+**Target (functional):**
+
+```ts
+// features/patients/hooks/usePatientForm.ts
+import { useFormBase } from "@/shared/hooks/useFormBase";
+import * as api from "@/shared/services/api/patients.api";
+import { z } from "zod";
+
+const PatientSchema = z.object({
+  id: z.string().optional(),
+  firstName: z.string().min(1),
+  lastName: z.string().min(1),
+  birthdate: z.string(),
+  sex: z.enum(["MALE", "FEMALE"]),
+});
+export type Patient = z.infer<typeof PatientSchema>;
+
+export function usePatientForm(initial?: Partial<Patient>) {
+  const form = useFormBase<Patient>({
+    initial: { id: "", firstName: "", lastName: "", birthdate: "", sex: "MALE", ...initial },
+    validate: (v) => {
+      const res = PatientSchema.safeParse(v);
+      return res.success ? null : res.error.flatten().fieldErrors;
+    },
+    submit: async (v) => (v.id ? api.update(v.id, v) : api.create(v)),
+  });
+
+  // Additional feature-specific logic (derived state, side-effects) here…
+  return form;
+}
+```
+
+```tsx
+// features/patients/components/PatientFormView.tsx (presentational)
+import React from "react";
+import { Patient } from "../hooks/usePatientForm";
+
+type Props = {
+  values: Patient;
+  setField: <K extends keyof Patient>(k: K, v: Patient[K]) => void;
+  submitting: boolean;
+  onSubmit: () => void;
+};
+
+export default function PatientFormView({ values, setField, submitting, onSubmit }: Props) {
+  return (
+    <form onSubmit={(e) => { e.preventDefault(); onSubmit(); }}>
+      <label>Last Name</label>
+      <input
+        value={values.lastName}
+        onChange={(e) => setField("lastName", e.target.value)}
+        placeholder="Dela Cruz"
+      />
+      {/* …rest of the fields … */}
+      <button disabled={submitting} type="submit">Save</button>
+    </form>
+  );
+}
+```
+
+```tsx
+// features/patients/pages/PatientCreatePage.tsx
+import PatientFormView from "../components/PatientFormView";
+import { usePatientForm } from "../hooks/usePatientForm";
+
+export default function PatientCreatePage() {
+  const { values, setField, submitting, onSubmit } = usePatientForm();
+  return <PatientFormView values={values} setField={setField} submitting={submitting} onSubmit={onSubmit} />;
+}
+```
+
+**Result**: Clean separation—hook owns logic, view is pure UI, page wires them.
+
+---
+
+## Example: Migrating a List Screen
+```ts
+// shared/hooks/useListBase.ts
+import { useEffect, useState } from "react";
+
+export type ListBaseConfig<T, Q = unknown> = {
+  query: (query: Q) => Promise<{ items: T[]; total: number }>;
+  initialQuery?: Q;
+};
+
+export function useListBase<T, Q = unknown>(cfg: ListBaseConfig<T, Q>) {
+  const [items, setItems] = useState<T[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [query, setQuery] = useState<Q | undefined>(cfg.initialQuery);
+
+  const refresh = async () => {
+    setLoading(true);
+    const res = await cfg.query(query as Q);
+    setItems(res.items);
+    setTotal(res.total);
+    setLoading(false);
+  };
+
+  useEffect(() => { refresh(); }, [JSON.stringify(query)]);
+
+  return { items, total, loading, query, setQuery, refresh };
+}
+```
+
+```ts
+// features/patients/hooks/usePatientList.ts
+import { useListBase } from "@/shared/hooks/useListBase";
+import * as api from "@/shared/services/api/patients.api";
+
+export function usePatientList() {
+  return useListBase({
+    query: (q) => api.search(q),
+    initialQuery: { page: 1, limit: 20, sort: "-createdAt" },
+  });
+}
+```
+
+```tsx
+// features/patients/components/PatientListView.tsx (presentational)
+export function PatientListView({ items, loading, total, onReload }) {
+  if (loading) return <div>Loading…</div>;
+  return (
+    <div>
+      <header>
+        <h2>Patients ({total})</h2>
+        <button onClick={onReload}>Reload</button>
+      </header>
+      <ul>{items.map((p: any) => <li key={p.id}>{p.lastName}, {p.firstName}</li>)}</ul>
+    </div>
+  );
+}
+```
+
+---
+
+## Reuse Patterns (Inheritance → Composition)
+- **Base Hooks**: abstract shared flows (`useFormBase`, `useListBase`, `useEntityBase`).  
+- **Hook Combinators**: merge outputs into a single API.
+
+```ts
+// shared/hooks/composeHooks.ts
+export function composeHooks<T extends Record<string, any>>(...parts: T[]): T {
+  return parts.reduce((acc, cur) => Object.assign(acc, cur), {} as T);
+}
+```
+
+- **Headless Components**: layout-only shells (`FormShell`, `DataTable`). Logic remains in hooks.
+- **Configuration Objects**: pass behavior as parameters (validators, adapters, permissions).
+
+---
+
+## Services & Side Effects
+- **HTTP Client** in `shared/services/http/client.ts` with interceptors.
+- **Typed API modules** per resource (`patients.api.ts`). Hooks never embed fetch code.
+- **Storage/Router** wrappers so hooks can switch implementations in tests.
+
+```ts
+// shared/services/api/patients.api.ts
+import { client } from "../http/client";
+import { Patient } from "@/shared/types";
+
+export const create = (p: Patient) => client.post("/patients", p).then(r => r.data);
+export const update = (id: string, p: Patient) => client.put(`/patients/${id}`, p).then(r => r.data);
+export const search = (q: any) => client.get("/patients", { params: q }).then(r => r.data);
+```
+
+---
+
+## State Ownership and Data Flow
+- **Hooks own state**; Views receive props only.
+- **Context Providers** for cross-cutting state (auth, theme). Avoid giant global stores.
+- **React Query (optional)** for server cache; wrap in services if you need isolation.
+
+---
+
+## TypeScript Contracts
+- Export **stable prop types** from hooks to views.
+- Co-locate **zod** schemas with hooks for in-place validation, or in `/shared/validation` for cross-feature reuse.
+
+---
+
+## Testing Strategy
+- **Hook tests**: exercise validation, branching, API calls using mocked services.
+- **Component tests**: render presentational components with representative props.
+- **Page tests**: thin smoke tests; most logic already covered in hooks.
+
+---
+
+## Migration Playbook (MVP → Functional)
+1. **Inventory**: list Presenters and their responsibilities from your MVP doc.
+2. **Partition** responsibilities into:
+   - `use*` hooks (state/branching/side-effects orchestration)
+   - `services/*` (I/O)
+   - `components/*` (pure rendering)
+3. **Create base hooks** to replace `BasePresenter`/`BaseForm`.
+4. **Move I/O** from Presenters to `services/api/*.ts` modules.
+5. **Refactor Views** into pure presentational components; keep only JSX and callbacks.
+6. **Replace inheritance** with composition:
+   - Start by implementing `useFormBase` and `useListBase` once.
+   - Compose/extend via options (validators, adapters).
+7. **Adopt folder structure** above; migrate feature-by-feature.
+8. **Add tests** for new hooks before deleting the old presenters.
+9. **Delete class code** after parity is verified.
+
+---
+
+## Presenter → Hook Mapping Table
+Fill this as you migrate.
+
+| MVP Presenter/Class | New Hook(s) | New Service(s) | New View(s) | Notes |
+|---|---|---|---|---|
+| `BasePresenter` | `useFormBase`, `useListBase`, `useEntityBase` | `http/client` | `FormShell`, `DataTable` | Split by concern |
+| `PatientPresenter` | `usePatientForm`, `usePatientList` | `patients.api` | `PatientFormView`, `PatientListView` |  |
+
+---
+
+## Appendix A — (Auto) Extracted headings from your MVP doc
+(First few headings only for orientation)
+```
+# Persona: MVP Architect - Schema-Driven React with Dependency Injection
+## Identity
+## Objective
+## 🧩 Core Responsibilities
+### View Layer (Pages)
+### Presenter Layer (Business Logic)
+### Model Layer (Data Access / Use Cases)
+## 🏗 Architecture Principles
+## 📦 Patterns & Components
+### Page Patterns
+### Presenter Patterns
+### Use Case Pattern
+## 🧪 Example Workflow
+## 📋 Page Structure Pattern
+### Every Page Contains Presenter and Page Components
+### Router Integration Pattern
+### Generic vs Custom Pages
+#### Generic Pages (Schema-Driven)
+## 🗂️ Menu Configuration Pattern
+### menus.js Structure
+### Menu Item Properties
+### Generic Collection Routes
+### When to Use Generic vs Custom Pages
+#### Use Generic Pages When:
+#### Use Custom Pages When:
+## 🛠 Architectural Guidelines
+## Project Structure
+### Directory Organization
+### Naming Conventions
+## 🔧 Base Classes Implementation
+```
+
+
+---
+
+## Appendix B — Coding Standards
+- **Naming**: hooks `useXForm`, services `x.api.ts`, views `XFormView.tsx`.
+- **Side effects**: only in hooks; wrap all I/O in services.
+- **Events up, data down**: views raise events; hooks update state and call services.
